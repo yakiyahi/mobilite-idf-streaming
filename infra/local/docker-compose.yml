@@ -1,0 +1,156 @@
+name: mobilite-idf
+
+# Environnement 100 % local : tout tourne dans Docker sur ta machine, rien ne sort vers le cloud.
+# Les versions et identifiants viennent du fichier .env (voir .env.example).
+#
+# On avance par étapes. Chaque étape se démarre seule :
+#   ÉTAPE 1  docker compose -f infra/local/docker-compose.yml up -d redpanda
+#   ÉTAPE 2  docker compose -f infra/local/docker-compose.yml up -d minio s3-init
+#   ÉTAPE 3  docker compose -f infra/local/docker-compose.yml up -d --build connect connect-init
+
+services:
+  # =============================================================== ÉTAPE 1 : Kafka
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION}
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      # Adresses sur lesquelles Redpanda écoute : une pour les conteneurs, une pour ta machine
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      # Adresses qu'il annonce aux clients : chaque client doit pouvoir les joindre
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+    ports:
+      - "19092:19092"   # Kafka, depuis ta machine (producteurs Python)
+      - "18081:18081"   # Schema Registry, depuis ta machine
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # Idempotent : ne recrée pas le topic s'il existe déjà.
+    command:
+      - |
+        rpk topic describe velib.station_status.v1 --brokers redpanda:9092 >/dev/null 2>&1 \
+        || rpk topic create velib.station_status.v1 --brokers redpanda:9092 --partitions 3 --replicas 1
+    restart: "no"
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:${CONSOLE_VERSION}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+    ports:
+      - "8080:8080"     # topics, messages, schémas
+
+  # ============================================================== ÉTAPE 2 : MinIO
+  minio:
+    # Image maintenue par Chainguard (MinIO ne publie plus ses propres images, voir ADR-0008).
+    # Le point d'entrée de l'image est le binaire « minio » : la commande ne donne que ses arguments.
+    image: ${MINIO_IMAGE}
+    command: server /data --console-address ":9001"
+    # Si « minio » se plaint de ne pas pouvoir écrire dans /data (permission denied), décommente :
+    # user: "0:0"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9000:9000"     # API S3 (utilisée par Kafka Connect et Spark)
+      - "9001:9001"     # console web
+    volumes:
+      - minio-data:/data
+
+  # Crée le bucket au démarrage. aws-cli sert ici de simple client S3.
+  s3-init:
+    image: amazon/aws-cli:${AWSCLI_VERSION}
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET}
+    command:
+      - |
+        until aws --endpoint-url http://minio:9000 s3 ls >/dev/null 2>&1; do
+          echo "attente de MinIO..."; sleep 2
+        done
+        aws --endpoint-url http://minio:9000 s3api head-bucket --bucket $${S3_BUCKET} 2>/dev/null \
+        || aws --endpoint-url http://minio:9000 s3 mb s3://$${S3_BUCKET}
+    restart: "no"
+
+  # ========================================================= ÉTAPE 3 : Kafka Connect
+  connect:
+    build:
+      context: ./connect
+      args:
+        CP_VERSION: ${CP_VERSION}
+        S3_CONNECTOR_VERSION: ${S3_CONNECTOR_VERSION}
+    image: mobilite-idf/connect-s3:${CP_VERSION}-${S3_CONNECTOR_VERSION}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: redpanda:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_GROUP_ID: connect-mobilite-idf
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://redpanda:8081
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      # Identifiants lus par le client S3 du connecteur (chaîne d'identifiants AWS par défaut)
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+    ports:
+      - "8083:8083"     # API REST de Kafka Connect
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+
+  # Enregistre le connecteur. PUT sur /config = idempotent (crée ou met à jour).
+  connect-init:
+    image: mobilite-idf/connect-s3:${CP_VERSION}-${S3_CONNECTOR_VERSION}
+    depends_on:
+      connect:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        curl -fsS -X PUT -H "Content-Type: application/json" \
+          --data @/config/velib-s3-sink.json \
+          http://connect:8083/connectors/velib-s3-sink/config
+    volumes:
+      - ./connectors:/config:ro
+    restart: "no"
+
+volumes:
+  minio-data:
